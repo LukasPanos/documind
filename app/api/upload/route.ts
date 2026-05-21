@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { PDFParse } from "pdf-parse";
+import { extractText } from "unpdf";
 import { getSupabase } from "@/lib/supabase";
 import { embedBatch } from "@/lib/openai";
 import { getAnthropic, CHAT_MODEL } from "@/lib/anthropic";
@@ -75,12 +75,15 @@ export async function POST(request: NextRequest) {
 
     let text: string;
     try {
-      const buffer = Buffer.from(await file.arrayBuffer());
-      const parser = new PDFParse({ data: buffer });
-      const result = await parser.getText();
-      await parser.destroy();
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await extractText(new Uint8Array(arrayBuffer), {
+        mergePages: true,
+      });
       text = result.text;
-      console.log("[upload] pdf parsed", { chars: text?.length ?? 0 });
+      console.log("[upload] pdf parsed", {
+        pages: result.totalPages,
+        chars: text?.length ?? 0,
+      });
     } catch (err) {
       const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       const stack = err instanceof Error ? err.stack : undefined;
