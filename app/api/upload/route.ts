@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { PDFParse } from "pdf-parse";
 import { getSupabase } from "@/lib/supabase";
 import { embedBatch } from "@/lib/openai";
 import { getAnthropic, CHAT_MODEL } from "@/lib/anthropic";
@@ -75,18 +76,16 @@ export async function POST(request: NextRequest) {
     let text: string;
     try {
       const buffer = Buffer.from(await file.arrayBuffer());
-      const { PDFParse } = await import("pdf-parse");
       const parser = new PDFParse({ data: buffer });
       const result = await parser.getText();
       await parser.destroy();
       text = result.text;
       console.log("[upload] pdf parsed", { chars: text?.length ?? 0 });
     } catch (err) {
-      return jsonError(
-        "Failed to parse PDF. The file may be encrypted, image-only, or malformed.",
-        422,
-        err instanceof Error ? err.message : err
-      );
+      const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      const stack = err instanceof Error ? err.stack : undefined;
+      console.error("[upload] pdf parse failure", { detail, stack });
+      return jsonError("Failed to parse PDF.", 422, detail);
     }
 
     if (!text || text.trim().length < 20) {

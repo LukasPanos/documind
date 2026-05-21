@@ -63,14 +63,28 @@ export default function UploadPage() {
         fd.append("file", file);
 
         const res = await fetch("/api/upload", { method: "POST", body: fd });
-        const json = await res.json();
+        const raw = await res.text();
+        let json: {
+          error?: string;
+          detail?: string;
+          document?: { name: string };
+          chunk_count?: number;
+        } = {};
+        try {
+          json = raw ? JSON.parse(raw) : {};
+        } catch {
+          throw new Error(
+            `Server returned ${res.status} ${res.statusText} (non-JSON): ${raw.slice(0, 300)}`
+          );
+        }
 
         if (!res.ok) {
-          throw new Error(json.error ?? "Upload failed");
+          const msg = json.error ?? `Upload failed (${res.status})`;
+          throw new Error(json.detail ? `${msg} — ${json.detail}` : msg);
         }
 
         setStatusMessage(
-          `Added ${json.document.name} (${json.chunk_count} chunks indexed).`
+          `Added ${json.document?.name ?? file.name} (${json.chunk_count} chunks indexed).`
         );
         await refresh();
       } catch (err) {
