@@ -1,18 +1,24 @@
 import OpenAI from "openai";
 
-const apiKey = process.env.OPENAI_API_KEY;
-
-if (!apiKey) {
-  throw new Error("Missing OPENAI_API_KEY in .env.local");
-}
-
-export const openai = new OpenAI({ apiKey });
+let cached: OpenAI | null = null;
 
 export const EMBEDDING_MODEL = "text-embedding-3-small";
 export const EMBEDDING_DIMENSIONS = 1536;
 
+export function getOpenAI(): OpenAI {
+  if (cached) return cached;
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "OPENAI_API_KEY is not set. Add it to your Vercel project's Environment Variables."
+    );
+  }
+  cached = new OpenAI({ apiKey });
+  return cached;
+}
+
 export async function embed(text: string): Promise<number[]> {
-  const res = await openai.embeddings.create({
+  const res = await getOpenAI().embeddings.create({
     model: EMBEDDING_MODEL,
     input: text,
   });
@@ -20,7 +26,7 @@ export async function embed(text: string): Promise<number[]> {
 }
 
 export async function embedBatch(texts: string[]): Promise<number[][]> {
-  const res = await openai.embeddings.create({
+  const res = await getOpenAI().embeddings.create({
     model: EMBEDDING_MODEL,
     input: texts,
   });

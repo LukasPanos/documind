@@ -1,11 +1,17 @@
 import Anthropic from "@anthropic-ai/sdk";
 
-const apiKey = process.env.ANTHROPIC_API_KEY;
-
-if (!apiKey) {
-  throw new Error("Missing ANTHROPIC_API_KEY in .env.local");
-}
-
-export const anthropic = new Anthropic({ apiKey });
+let cached: Anthropic | null = null;
 
 export const CHAT_MODEL = "claude-sonnet-4-20250514";
+
+export function getAnthropic(): Anthropic {
+  if (cached) return cached;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "ANTHROPIC_API_KEY is not set. Add it to your Vercel project's Environment Variables."
+    );
+  }
+  cached = new Anthropic({ apiKey });
+  return cached;
+}

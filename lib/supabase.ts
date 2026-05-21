@@ -1,17 +1,26 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const url = process.env.SUPABASE_URL;
-const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let cached: SupabaseClient | null = null;
 
-if (!url || !serviceKey) {
-  throw new Error(
-    "Missing Supabase env vars. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.local"
-  );
+export function getSupabase(): SupabaseClient {
+  if (cached) return cached;
+  const url = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url) {
+    throw new Error(
+      "SUPABASE_URL is not set. Add it to your Vercel project's Environment Variables."
+    );
+  }
+  if (!serviceKey) {
+    throw new Error(
+      "SUPABASE_SERVICE_ROLE_KEY is not set. Add it to your Vercel project's Environment Variables."
+    );
+  }
+  cached = createClient(url, serviceKey, {
+    auth: { persistSession: false },
+  });
+  return cached;
 }
-
-export const supabase = createClient(url, serviceKey, {
-  auth: { persistSession: false },
-});
 
 export type DocumentRow = {
   id: string;
