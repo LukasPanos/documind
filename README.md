@@ -1,9 +1,9 @@
 # DocMind — AI-Powered Document Intelligence Platform
 
-DocMind is a RAG (Retrieval-Augmented Generation) web app that lets you upload PDFs and chat with them. Ask questions, get summaries, and run semantic search across your document library — with cited, traceable answers powered by a vector search engine built from scratch.
+DocMind is a RAG (Retrieval-Augmented Generation) web app that lets you upload PDFs and chat with them. Ask questions, get summaries, and run semantic search across your document library — with cited, traceable answers powered by a pgvector store built from scratch.
 
-**Live demo:** [documind-kohl-xi.vercel.app/]  
-**Stack:** Next.js 14 · Supabase pgvector · OpenAI Embeddings · Anthropic Claude · Tailwind CSS
+**Live demo:** https://documind-kohl-xi.vercel.app
+**Stack:** Next.js 16 (App Router) · React 19 · Supabase pgvector · OpenAI Embeddings · Anthropic Claude · Tailwind CSS v4
 
 ---
 
@@ -14,6 +14,7 @@ DocMind is a RAG (Retrieval-Augmented Generation) web app that lets you upload P
 - **Semantic search** — queries are embedded and matched against document chunks using cosine similarity, not keyword search
 - **Cited answers** — every response shows exactly which chunk it pulled from, with document name and chunk index
 - **Multi-doc or single-doc scope** — chat across your entire library or pin a conversation to one document
+- **Persistent multi-conversation history** — every document (and the "All documents" scope) has its own sidebar of past chats. Start a new chat, switch between them, and pick up old threads with up to 40 turns of context.
 
 ---
 
@@ -21,19 +22,20 @@ DocMind is a RAG (Retrieval-Augmented Generation) web app that lets you upload P
 
 ### 1. Ingestion pipeline
 When a PDF is uploaded, the backend:
-1. Extracts raw text using `pdf-parse`
-2. Splits the text into ~500 token chunks with 50 token overlap (preserving sentence boundaries)
-3. Embeds each chunk using OpenAI `text-embedding-3-small` (1536 dimensions)
+1. Extracts raw text using `unpdf` (a serverless-friendly pdf.js wrapper)
+2. Splits the text into ~500 token chunks with 50 token overlap, snapping to paragraph and sentence boundaries
+3. Embeds each chunk in batches using OpenAI `text-embedding-3-small` (1536 dimensions)
 4. Stores chunks + embeddings in Supabase with `pgvector`
-5. Generates an auto-summary by passing the full text to Claude
+5. Generates an auto-summary by passing the first ~12k characters of the document to Claude
 
 ### 2. Retrieval (the RAG part)
 When a user asks a question:
 1. The query is embedded using the same OpenAI model
 2. A cosine similarity search runs against all stored chunk embeddings via a Supabase RPC function (`match_chunks`)
-3. The top 5 most relevant chunks are retrieved
-4. Chunks are injected into Claude's context window as grounding material
+3. The top 5 most relevant chunks are retrieved, optionally filtered to a single document
+4. Chunks are injected into Claude's context window as grounding material, alongside the last 40 turns of conversation history
 5. Claude streams a response back, citing the specific chunks it used
+6. The user + assistant turns (including citations) are persisted to the conversation
 
 ### 3. Vector search engine
 Rather than using a managed vector database like Pinecone or Weaviate, this project uses **Supabase with the pgvector extension** — a PostgreSQL-native vector store. This means:
@@ -49,59 +51,104 @@ Rather than using a managed vector database like Pinecone or Weaviate, this proj
 User uploads PDF
       │
       ▼
-/api/upload
-  ├── pdf-parse → raw text
-  ├── chunk.ts → ~500 token chunks (50 token overlap)
-  ├── OpenAI text-embedding-3-small → vector[1536] per chunk
-  ├── Supabase → insert into documents + chunks tables
-  └── Claude claude-sonnet-4-20250514 → auto-summary stored on document
+POST /api/upload
+  ├── unpdf            → raw text
+  ├── lib/chunk.ts     → ~500 token chunks (50 token overlap)
+  ├── OpenAI           → text-embedding-3-small → vector(1536) per chunk
+  ├── Supabase         → insert documents row + chunks rows
+  └── Claude           → one-paragraph summary, stored on the document
 
 User asks a question
       │
       ▼
-/api/chat
-  ├── OpenAI → embed the query
-  ├── Supabase match_chunks() RPC → cosine similarity search (top 5)
-  ├── Claude claude-sonnet-4-20250514 → answer grounded in retrieved chunks
-  └── NDJSON stream → client renders text + citations in real time
+POST /api/chat
+  ├── Supabase         → load (or create) the active conversation
+  ├── Supabase         → fetch up to 40 prior turns for context
+  ├── OpenAI           → embed the query
+  ├── Supabase         → match_chunks() RPC, cosine similarity (top 5)
+  ├── Claude           → answer grounded in retrieved chunks + chat history
+  ├── NDJSON stream    → client renders conversation_id, citations, deltas
+  └── Supabase         → persist the user + assistant turn (with citations)
 ```
 
 ---
 
 ## Database schema
 
+The canonical schema lives in [`supabase/schema.sql`](./supabase/schema.sql). Condensed:
+
 ```sql
--- pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector;
+create extension if not exists vector;
+create extension if not exists "pgcrypto";
 
--- Documents table
-CREATE TABLE documents (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name TEXT NOT NULL,
-  summary TEXT,
-  created_at TIMESTAMPTZ DEFAULT now()
+create table documents (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null,
+  summary     text,
+  created_at  timestamptz default now()
 );
 
--- Chunks table with vector embeddings
-CREATE TABLE chunks (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
-  content TEXT NOT NULL,
-  embedding vector(1536),
-  chunk_index INT
+create table chunks (
+  id           uuid primary key default gen_random_uuid(),
+  document_id  uuid references documents(id) on delete cascade,
+  content      text not null,
+  embedding    vector(1536) not null,
+  chunk_index  int not null
 );
 
--- IVFFlat index for fast cosine similarity search
-CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops);
+create index on chunks using ivfflat (embedding vector_cosine_ops);
 
--- RPC function for similarity search
-CREATE OR REPLACE FUNCTION match_chunks(
-  query_embedding vector(1536),
-  match_count INT,
-  filter_document_id UUID DEFAULT NULL
-)
-RETURNS TABLE (id UUID, document_id UUID, content TEXT, chunk_index INT, similarity FLOAT)
-...
+-- Many conversations per document (and per "All documents" scope where
+-- document_id is null). Each conversation owns an ordered list of messages.
+create table conversations (
+  id          uuid primary key default gen_random_uuid(),
+  document_id uuid references documents(id) on delete cascade,
+  title       text,
+  created_at  timestamptz default now(),
+  updated_at  timestamptz default now()
+);
+
+create table messages (
+  id              uuid primary key default gen_random_uuid(),
+  conversation_id uuid references conversations(id) on delete cascade,
+  role            text check (role in ('user', 'assistant')),
+  content         text not null,
+  citations       jsonb,
+  created_at      timestamptz default now()
+);
+
+-- Cosine similarity RPC, optionally scoped to one document.
+create function match_chunks(
+  query_embedding    vector(1536),
+  match_count        int default 5,
+  filter_document_id uuid default null
+) returns table (...);
+```
+
+An `AFTER INSERT` trigger on `messages` bumps `conversations.updated_at` so the sidebar sorts by most recent activity.
+
+---
+
+## Project layout
+
+```
+app/
+  api/
+    upload/route.ts            PDF → chunk → embed → store + Claude summary
+    chat/route.ts              Query embed → vector search → stream Claude
+    conversations/
+      route.ts                 GET list of chats for a scope
+      [id]/route.ts            DELETE / PATCH a chat
+  upload/page.tsx              Drag-and-drop, document library w/ summaries
+  chat/page.tsx                Sidebar of conversations + streaming chat UI
+lib/
+  chunk.ts                     Boundary-aware chunker (500 tokens, 50 overlap)
+  openai.ts                    Embeddings client (text-embedding-3-small)
+  anthropic.ts                 Claude client (claude-sonnet-4-20250514)
+  supabase.ts                  Lazy-init Supabase client with URL validation
+  env-debug.ts                 Redacted env logging for Vercel diagnostics
+supabase/
+  schema.sql                   Tables, indexes, RPC, trigger — idempotent
 ```
 
 ---
@@ -117,7 +164,7 @@ npm install
 
 **2. Set up Supabase**
 - Create a project at [supabase.com](https://supabase.com)
-- Run `supabase/schema.sql` in the SQL editor
+- Open the SQL editor and run [`supabase/schema.sql`](./supabase/schema.sql)
 
 **3. Configure environment variables**
 ```bash
@@ -125,19 +172,18 @@ cp .env.local.example .env.local
 ```
 Fill in:
 ```
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
 ```
+> `SUPABASE_URL` must be the bare project origin (no `/rest/v1`, no trailing slash). The service role key is server-only and bypasses RLS — never expose it to the browser.
 
 **4. Run**
 ```bash
 npm run dev
 ```
-Visit `http://localhost:3000/upload`
+Visit `http://localhost:3000/upload`, drop in a PDF, then head to `/chat`.
 
 ---
 
@@ -146,9 +192,11 @@ Visit `http://localhost:3000/upload`
 | Decision | Why |
 |---|---|
 | pgvector over Pinecone | No external dependency, full SQL control, demonstrates understanding of how vector search actually works |
-| OpenAI for embeddings, Anthropic for generation | Best-in-class embedding model paired with Claude's superior reasoning and instruction-following |
-| NDJSON streaming over SSE | Simpler to parse on the client while still enabling real-time citations interleaved with text |
-| 500 token chunks / 50 token overlap | Balances context density with retrieval precision; overlap prevents answers from falling at chunk boundaries |
+| OpenAI for embeddings, Anthropic for generation | Best-in-class embedding model paired with Claude's reasoning and instruction-following |
+| `unpdf` over `pdf-parse` | Purpose-built for serverless (Vercel, Cloudflare, Deno); no pdf.js worker setup or DOM polyfills required |
+| NDJSON streaming over SSE | One JSON object per line is easy to parse on the client and lets the server interleave `conversation` / `citations` / `delta` / `persist_error` events with the streamed text |
+| 500 token chunks / 50 token overlap | Balances context density with retrieval precision; overlap keeps answers from falling at chunk boundaries |
+| Multiple conversations per scope | A document is a body of knowledge, not a single thread — researchers want separate, named investigations |
 
 ---
 
