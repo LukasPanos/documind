@@ -23,6 +23,22 @@ create index if not exists chunks_document_id_idx on chunks (document_id);
 create index if not exists chunks_embedding_idx on chunks
   using ivfflat (embedding vector_cosine_ops) with (lists = 100);
 
+-- One persistent chat thread per document (plus one "all documents" thread
+-- where document_id is null). Citations are stored alongside the assistant
+-- message so they survive reloads.
+create table if not exists messages (
+  id uuid primary key default gen_random_uuid(),
+  document_id uuid references documents(id) on delete cascade,
+  role text not null check (role in ('user', 'assistant')),
+  content text not null,
+  citations jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists messages_doc_idx on messages (document_id, created_at);
+create index if not exists messages_all_idx on messages (created_at)
+  where document_id is null;
+
 -- Cosine-similarity RPC. Pass an optional document_id to restrict to a single doc.
 create or replace function match_chunks(
   query_embedding vector(1536),

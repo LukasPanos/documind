@@ -28,16 +28,24 @@ type Message = {
 
 const ALL_DOCS = "__all__";
 
+function scopeParam(selected: string): string {
+  return selected === ALL_DOCS ? "null" : selected;
+}
+
 export default function ChatPage() {
   const [documents, setDocuments] = useState<DocumentRow[]>([]);
   const [selected, setSelected] = useState<string>(ALL_DOCS);
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [busy, setBusy] = useState(false);
+  const [loadedFor, setLoadedFor] = useState<string | null>(null);
   const [openCitations, setOpenCitations] = useState<Record<string, boolean>>(
     {}
   );
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Derived: history is "loading" any time the loaded scope doesn't match.
+  const loadingHistory = loadedFor !== selected;
 
   useEffect(() => {
     fetch("/api/upload")
@@ -45,6 +53,39 @@ export default function ChatPage() {
       .then((j) => setDocuments(j.documents ?? []))
       .catch(() => {});
   }, []);
+
+  // Load saved history whenever the scope changes.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/chat?document_id=${encodeURIComponent(scopeParam(selected))}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancelled) return;
+        const stored: {
+          id: string;
+          role: "user" | "assistant";
+          content: string;
+          citations: Citation[] | null;
+        }[] = j.messages ?? [];
+        setMessages(
+          stored.map((m) => ({
+            id: m.id,
+            role: m.role,
+            text: m.content,
+            citations: m.citations ?? undefined,
+          }))
+        );
+        setLoadedFor(selected);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setMessages([]);
+        setLoadedFor(selected);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -154,12 +195,40 @@ export default function ChatPage() {
     }
   }, [input, busy, selected]);
 
+  const clearThread = useCallback(async () => {
+    if (busy) return;
+    if (
+      !confirm(
+        selected === ALL_DOCS
+          ? "Clear the All documents chat history?"
+          : "Clear chat history for this document?"
+      )
+    ) {
+      return;
+    }
+    await fetch(
+      `/api/chat?document_id=${encodeURIComponent(scopeParam(selected))}`,
+      { method: "DELETE" }
+    ).catch(() => {});
+    setMessages([]);
+  }, [busy, selected]);
+
+  const selectedName =
+    selected === ALL_DOCS
+      ? "All documents"
+      : documents.find((d) => d.id === selected)?.name ?? "Document";
+
   return (
     <div className="flex-1 flex flex-col mx-auto w-full max-w-4xl px-6 py-6">
       <div className="flex items-center justify-between mb-4">
-        <h1 className="text-2xl font-semibold tracking-tight text-white">
-          Chat
-        </h1>
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-white">
+            Chat
+          </h1>
+          <p className="text-xs text-zinc-500 mt-0.5">
+            Saved thread · {selectedName}
+          </p>
+        </div>
         <div className="flex items-center gap-2">
           <label className="text-xs text-zinc-500 uppercase tracking-wider">
             Scope
@@ -176,6 +245,15 @@ export default function ChatPage() {
               </option>
             ))}
           </select>
+          <button
+            type="button"
+            onClick={clearThread}
+            disabled={busy || messages.length === 0}
+            className="text-xs px-2.5 py-1.5 rounded-md border border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="Clear this thread's history"
+          >
+            Clear
+          </button>
         </div>
       </div>
 
@@ -183,9 +261,13 @@ export default function ChatPage() {
         ref={scrollRef}
         className="flex-1 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-950/40 p-6 min-h-[60vh]"
       >
-        {messages.length === 0 ? (
+        {loadingHistory ? (
+          <div className="h-full flex items-center justify-center text-zinc-600 text-sm">
+            Loading history…
+          </div>
+        ) : messages.length === 0 ? (
           <div className="h-full flex items-center justify-center text-zinc-500 text-sm">
-            Ask a question. Answers come back with citations.
+            No messages yet. Ask a question to start this thread.
           </div>
         ) : (
           <div className="space-y-6">
