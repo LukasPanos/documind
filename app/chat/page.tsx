@@ -18,6 +18,14 @@ type Citation = {
   similarity: number;
 };
 
+type Conversation = {
+  id: string;
+  document_id: string | null;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 type Message = {
   id: string;
   role: "user" | "assistant";
@@ -28,27 +36,53 @@ type Message = {
 
 const ALL_DOCS = "__all__";
 
-function scopeParam(selected: string): string {
-  return selected === ALL_DOCS ? "null" : selected;
+function scopeMatches(conv: Conversation, selected: string): boolean {
+  return selected === ALL_DOCS
+    ? conv.document_id === null
+    : conv.document_id === selected;
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  return new Date(iso).toLocaleDateString();
 }
 
 export default function ChatPage() {
   const [documents, setDocuments] = useState<DocumentRow[]>([]);
   const [selected, setSelected] = useState<string>(ALL_DOCS);
+
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [loadedConvsFor, setLoadedConvsFor] = useState<string | null>(null);
+
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [loadedMessagesFor, setLoadedMessagesFor] = useState<string | null>(
+    null
+  );
   const [busy, setBusy] = useState(false);
-  const [loadedFor, setLoadedFor] = useState<string | null>(null);
+
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [persistError, setPersistError] = useState<string | null>(null);
+
   const [openCitations, setOpenCitations] = useState<Record<string, boolean>>(
     {}
   );
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Derived: history is "loading" any time the loaded scope doesn't match.
-  const loadingHistory = loadedFor !== selected;
+  const loadingConvs = loadedConvsFor !== selected;
+  const loadingMessages =
+    activeId !== null && loadedMessagesFor !== activeId;
 
+  // Fetch document library once.
   useEffect(() => {
     fetch("/api/upload")
       .then((r) => r.json())
@@ -56,25 +90,75 @@ export default function ChatPage() {
       .catch(() => {});
   }, []);
 
-  // Load saved history whenever the scope changes.
+  // Refetch conversation list whenever scope changes.
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/chat?document_id=${encodeURIComponent(scopeParam(selected))}`)
+    const docParam = selected === ALL_DOCS ? "null" : selected;
+    fetch(`/api/conversations?document_id=${encodeURIComponent(docParam)}`)
       .then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json() }))
       .then(({ ok, status, body }) => {
         if (cancelled) return;
         if (!ok || body.error) {
-          const msg = body.error ?? `Failed to load history (${status})`;
+          const msg = body.error ?? `Failed to load chats (${status})`;
           const hint =
-            /relation .* does not exist|messages.*does not exist/i.test(msg)
-              ? " — rerun supabase/schema.sql so the messages table exists."
+            /relation .* does not exist|conversations.*does not exist|messages.*does not exist/i.test(
+              msg
+            )
+              ? " — rerun supabase/schema.sql so the conversations table exists."
               : "";
           setHistoryError(msg + hint);
+          setConversations([]);
+          setActiveId(null);
           setMessages([]);
-          setLoadedFor(selected);
+          setLoadedConvsFor(selected);
+          setLoadedMessagesFor(null);
           return;
         }
         setHistoryError(null);
+        const convs: Conversation[] = body.conversations ?? [];
+        setConversations(convs);
+        // Default: pick the most recent existing chat for this scope.
+        const next = convs[0]?.id ?? null;
+        setActiveId(next);
+        if (next === null) {
+          setMessages([]);
+          setLoadedMessagesFor(null);
+        }
+        setLoadedConvsFor(selected);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setHistoryError(
+          err instanceof Error ? err.message : "Failed to load chats"
+        );
+        setConversations([]);
+        setActiveId(null);
+        setMessages([]);
+        setLoadedConvsFor(selected);
+        setLoadedMessagesFor(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
+
+  // Load messages for whichever conversation is active. Skips when the
+  // active id is a freshly-streamed one (already in state) or null.
+  useEffect(() => {
+    if (activeId === null) return;
+    if (loadedMessagesFor === activeId) return;
+    let cancelled = false;
+    fetch(`/api/chat?conversation_id=${encodeURIComponent(activeId)}`)
+      .then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json() }))
+      .then(({ ok, status, body }) => {
+        if (cancelled) return;
+        if (!ok || body.error) {
+          const msg = body.error ?? `Failed to load messages (${status})`;
+          setHistoryError(msg);
+          setMessages([]);
+          setLoadedMessagesFor(activeId);
+          return;
+        }
         const stored: {
           id: string;
           role: "user" | "assistant";
@@ -89,20 +173,20 @@ export default function ChatPage() {
             citations: m.citations ?? undefined,
           }))
         );
-        setLoadedFor(selected);
+        setLoadedMessagesFor(activeId);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
         setHistoryError(
-          err instanceof Error ? err.message : "Failed to load history"
+          err instanceof Error ? err.message : "Failed to load messages"
         );
         setMessages([]);
-        setLoadedFor(selected);
+        setLoadedMessagesFor(activeId);
       });
     return () => {
       cancelled = true;
     };
-  }, [selected]);
+  }, [activeId, loadedMessagesFor]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -110,6 +194,14 @@ export default function ChatPage() {
       behavior: "smooth",
     });
   }, [messages]);
+
+  const startNewChat = useCallback(() => {
+    if (busy) return;
+    setActiveId(null);
+    setMessages([]);
+    setLoadedMessagesFor(null);
+    setPersistError(null);
+  }, [busy]);
 
   const send = useCallback(async () => {
     const query = input.trim();
@@ -133,12 +225,15 @@ export default function ChatPage() {
     setBusy(true);
     setPersistError(null);
 
+    let receivedConvId: string | null = null;
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query,
+          conversation_id: activeId,
           document_id: selected === ALL_DOCS ? null : selected,
         }),
       });
@@ -166,6 +261,7 @@ export default function ChatPage() {
             type: string;
             text?: string;
             citations?: Citation[];
+            conversation_id?: string;
             error?: string;
           };
           try {
@@ -173,7 +269,9 @@ export default function ChatPage() {
           } catch {
             continue;
           }
-          if (evt.type === "citations" && evt.citations) {
+          if (evt.type === "conversation" && evt.conversation_id) {
+            receivedConvId = evt.conversation_id;
+          } else if (evt.type === "citations" && evt.citations) {
             setMessages((m) =>
               m.map((msg) =>
                 msg.id === assistantId
@@ -196,6 +294,32 @@ export default function ChatPage() {
           }
         }
       }
+
+      // If the server created a new conversation for this turn, update
+      // local state and refresh the sidebar list.
+      if (receivedConvId && receivedConvId !== activeId) {
+        setActiveId(receivedConvId);
+        // The messages we just streamed are already in state; mark them
+        // as loaded for this id so the effect doesn't refetch and clobber.
+        setLoadedMessagesFor(receivedConvId);
+        // Refresh the conversation list to include the new one.
+        const docParam = selected === ALL_DOCS ? "null" : selected;
+        fetch(`/api/conversations?document_id=${encodeURIComponent(docParam)}`)
+          .then((r) => r.json())
+          .then((j) => setConversations(j.conversations ?? []))
+          .catch(() => {});
+      } else if (receivedConvId) {
+        // Bump this conversation to the top of the list (it was just used).
+        setConversations((cs) => {
+          const me = cs.find((c) => c.id === receivedConvId);
+          if (!me) return cs;
+          const rest = cs.filter((c) => c.id !== receivedConvId);
+          return [
+            { ...me, updated_at: new Date().toISOString() },
+            ...rest,
+          ];
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Request failed";
       setMessages((m) =>
@@ -213,41 +337,52 @@ export default function ChatPage() {
       );
       setBusy(false);
     }
-  }, [input, busy, selected]);
+  }, [input, busy, selected, activeId]);
 
-  const clearThread = useCallback(async () => {
-    if (busy) return;
-    if (
-      !confirm(
-        selected === ALL_DOCS
-          ? "Clear the All documents chat history?"
-          : "Clear chat history for this document?"
-      )
-    ) {
-      return;
-    }
-    await fetch(
-      `/api/chat?document_id=${encodeURIComponent(scopeParam(selected))}`,
-      { method: "DELETE" }
-    ).catch(() => {});
-    setMessages([]);
-  }, [busy, selected]);
+  const deleteConversation = useCallback(
+    async (id: string) => {
+      if (!confirm("Delete this chat? This cannot be undone.")) return;
+      const res = await fetch(`/api/conversations/${id}`, {
+        method: "DELETE",
+      }).catch(() => null);
+      if (!res || !res.ok) {
+        const errJson = await res?.json().catch(() => ({}));
+        setHistoryError(errJson?.error ?? "Failed to delete chat");
+        return;
+      }
+      setConversations((cs) => cs.filter((c) => c.id !== id));
+      if (id === activeId) {
+        const remaining = conversations.filter((c) => c.id !== id);
+        const next = remaining[0]?.id ?? null;
+        setActiveId(next);
+        if (next === null) {
+          setMessages([]);
+          setLoadedMessagesFor(null);
+        } else {
+          setLoadedMessagesFor(null);
+        }
+      }
+    },
+    [activeId, conversations]
+  );
 
   const selectedName =
     selected === ALL_DOCS
       ? "All documents"
       : documents.find((d) => d.id === selected)?.name ?? "Document";
 
+  const visibleConversations = conversations.filter((c) =>
+    scopeMatches(c, selected)
+  );
+
   return (
-    <div className="flex-1 flex flex-col mx-auto w-full max-w-4xl px-6 py-6">
+    <div className="flex-1 flex flex-col mx-auto w-full max-w-6xl px-6 py-6">
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-white">
             Chat
           </h1>
-          <p className="text-xs text-zinc-500 mt-0.5">
-            Saved thread · {selectedName}
-          </p>
+          <p className="text-xs text-zinc-500 mt-0.5">{selectedName}</p>
         </div>
         <div className="flex items-center gap-2">
           <label className="text-xs text-zinc-500 uppercase tracking-wider">
@@ -265,15 +400,6 @@ export default function ChatPage() {
               </option>
             ))}
           </select>
-          <button
-            type="button"
-            onClick={clearThread}
-            disabled={busy || messages.length === 0}
-            className="text-xs px-2.5 py-1.5 rounded-md border border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            title="Clear this thread's history"
-          >
-            Clear
-          </button>
         </div>
       </div>
 
@@ -284,61 +410,134 @@ export default function ChatPage() {
         </div>
       )}
 
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-950/40 p-6 min-h-[60vh]"
-      >
-        {loadingHistory ? (
-          <div className="h-full flex items-center justify-center text-zinc-600 text-sm">
-            Loading history…
+      <div className="flex-1 grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4 min-h-[60vh]">
+        {/* Sidebar: past conversations for this scope */}
+        <aside className="rounded-xl border border-zinc-800 bg-zinc-950/40 flex flex-col overflow-hidden">
+          <button
+            type="button"
+            onClick={startNewChat}
+            disabled={busy}
+            className="m-2 inline-flex items-center justify-center gap-2 h-9 rounded-md bg-white text-black text-sm font-medium hover:bg-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            <span className="text-base leading-none">+</span> New chat
+          </button>
+          <div className="px-3 pb-2 text-xs uppercase tracking-wider text-zinc-500">
+            Past chats
           </div>
-        ) : messages.length === 0 ? (
-          <div className="h-full flex items-center justify-center text-zinc-500 text-sm">
-            No messages yet. Ask a question to start this thread.
-          </div>
-        ) : (
-          <div className="space-y-6">
-            {messages.map((m) => (
-              <MessageBubble
-                key={m.id}
-                message={m}
-                expanded={!!openCitations[m.id]}
-                onToggle={() =>
-                  setOpenCitations((s) => ({ ...s, [m.id]: !s[m.id] }))
-                }
-              />
-            ))}
-          </div>
-        )}
-      </div>
+          <ul className="flex-1 overflow-y-auto px-2 pb-2 space-y-1">
+            {loadingConvs ? (
+              <li className="px-2 py-2 text-xs text-zinc-600">Loading…</li>
+            ) : visibleConversations.length === 0 ? (
+              <li className="px-2 py-2 text-xs text-zinc-600">
+                No past chats yet.
+              </li>
+            ) : (
+              visibleConversations.map((c) => {
+                const isActive = c.id === activeId;
+                return (
+                  <li key={c.id}>
+                    <div
+                      className={`group rounded-md px-2 py-2 cursor-pointer transition-colors ${
+                        isActive
+                          ? "bg-zinc-800/80"
+                          : "hover:bg-zinc-900/80"
+                      }`}
+                      onClick={() => {
+                        if (busy || c.id === activeId) return;
+                        setActiveId(c.id);
+                      }}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm text-zinc-100 truncate">
+                            {c.title || "Untitled chat"}
+                          </div>
+                          <div className="text-[10px] text-zinc-500 mt-0.5">
+                            {relativeTime(c.updated_at)}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteConversation(c.id);
+                          }}
+                          className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 text-xs px-1 shrink-0"
+                          aria-label="Delete chat"
+                          title="Delete chat"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  </li>
+                );
+              })
+            )}
+          </ul>
+        </aside>
 
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          send();
-        }}
-        className="mt-4 flex gap-2"
-      >
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder={
-            documents.length
-              ? "Ask anything about your documents…"
-              : "Upload a document first, then ask away."
-          }
-          className="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600"
-          disabled={busy}
-        />
-        <button
-          type="submit"
-          disabled={busy || !input.trim()}
-          className="px-5 py-3 rounded-lg bg-white text-black font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-zinc-200 transition-colors"
-        >
-          {busy ? "…" : "Send"}
-        </button>
-      </form>
+        {/* Messages */}
+        <div className="flex flex-col min-h-[60vh]">
+          <div
+            ref={scrollRef}
+            className="flex-1 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-950/40 p-6"
+          >
+            {loadingMessages ? (
+              <div className="h-full flex items-center justify-center text-zinc-600 text-sm">
+                Loading messages…
+              </div>
+            ) : messages.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-zinc-500 text-sm">
+                {activeId === null
+                  ? "Ask a question to start a new chat."
+                  : "No messages yet."}
+              </div>
+            ) : (
+              <div className="space-y-6">
+                {messages.map((m) => (
+                  <MessageBubble
+                    key={m.id}
+                    message={m}
+                    expanded={!!openCitations[m.id]}
+                    onToggle={() =>
+                      setOpenCitations((s) => ({ ...s, [m.id]: !s[m.id] }))
+                    }
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              send();
+            }}
+            className="mt-4 flex gap-2"
+          >
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={
+                documents.length
+                  ? "Ask anything about your documents…"
+                  : "Upload a document first, then ask away."
+              }
+              className="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600"
+              disabled={busy}
+            />
+            <button
+              type="submit"
+              disabled={busy || !input.trim()}
+              className="px-5 py-3 rounded-lg bg-white text-black font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-zinc-200 transition-colors"
+            >
+              {busy ? "…" : "Send"}
+            </button>
+          </form>
+        </div>
+      </div>
     </div>
   );
 }

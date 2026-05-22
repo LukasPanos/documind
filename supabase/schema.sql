@@ -23,21 +23,54 @@ create index if not exists chunks_document_id_idx on chunks (document_id);
 create index if not exists chunks_embedding_idx on chunks
   using ivfflat (embedding vector_cosine_ops) with (lists = 100);
 
--- One persistent chat thread per document (plus one "all documents" thread
--- where document_id is null). Citations are stored alongside the assistant
--- message so they survive reloads.
-create table if not exists messages (
+-- Multiple chats per document (and per "All documents" scope where
+-- document_id is null). Each conversation holds an ordered list of
+-- messages. Re-running this script will reset chat history because
+-- the previous single-thread `messages` table is dropped.
+drop table if exists messages;
+
+create table if not exists conversations (
   id uuid primary key default gen_random_uuid(),
   document_id uuid references documents(id) on delete cascade,
+  title text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists conversations_doc_idx
+  on conversations (document_id, updated_at desc);
+create index if not exists conversations_all_idx
+  on conversations (updated_at desc)
+  where document_id is null;
+
+create table if not exists messages (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references conversations(id) on delete cascade,
   role text not null check (role in ('user', 'assistant')),
   content text not null,
   citations jsonb,
   created_at timestamptz not null default now()
 );
 
-create index if not exists messages_doc_idx on messages (document_id, created_at);
-create index if not exists messages_all_idx on messages (created_at)
-  where document_id is null;
+create index if not exists messages_conv_idx
+  on messages (conversation_id, created_at);
+
+-- Bump conversations.updated_at whenever a message is appended so the
+-- sidebar can sort by recent activity.
+create or replace function touch_conversation_updated_at()
+returns trigger language plpgsql as $$
+begin
+  update conversations
+    set updated_at = now()
+    where id = new.conversation_id;
+  return new;
+end;
+$$;
+
+drop trigger if exists messages_touch_conversation on messages;
+create trigger messages_touch_conversation
+  after insert on messages
+  for each row execute function touch_conversation_updated_at();
 
 -- Cosine-similarity RPC. Pass an optional document_id to restrict to a single doc.
 create or replace function match_chunks(
