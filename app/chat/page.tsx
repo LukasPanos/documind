@@ -39,6 +39,8 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [busy, setBusy] = useState(false);
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [persistError, setPersistError] = useState<string | null>(null);
   const [openCitations, setOpenCitations] = useState<Record<string, boolean>>(
     {}
   );
@@ -58,15 +60,27 @@ export default function ChatPage() {
   useEffect(() => {
     let cancelled = false;
     fetch(`/api/chat?document_id=${encodeURIComponent(scopeParam(selected))}`)
-      .then((r) => r.json())
-      .then((j) => {
+      .then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json() }))
+      .then(({ ok, status, body }) => {
         if (cancelled) return;
+        if (!ok || body.error) {
+          const msg = body.error ?? `Failed to load history (${status})`;
+          const hint =
+            /relation .* does not exist|messages.*does not exist/i.test(msg)
+              ? " — rerun supabase/schema.sql so the messages table exists."
+              : "";
+          setHistoryError(msg + hint);
+          setMessages([]);
+          setLoadedFor(selected);
+          return;
+        }
+        setHistoryError(null);
         const stored: {
           id: string;
           role: "user" | "assistant";
           content: string;
           citations: Citation[] | null;
-        }[] = j.messages ?? [];
+        }[] = body.messages ?? [];
         setMessages(
           stored.map((m) => ({
             id: m.id,
@@ -77,8 +91,11 @@ export default function ChatPage() {
         );
         setLoadedFor(selected);
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (cancelled) return;
+        setHistoryError(
+          err instanceof Error ? err.message : "Failed to load history"
+        );
         setMessages([]);
         setLoadedFor(selected);
       });
@@ -114,6 +131,7 @@ export default function ChatPage() {
     setMessages((m) => [...m, userMsg, assistantMsg]);
     setInput("");
     setBusy(true);
+    setPersistError(null);
 
     try {
       const res = await fetch("/api/chat", {
@@ -171,6 +189,8 @@ export default function ChatPage() {
                   : msg
               )
             );
+          } else if (evt.type === "persist_error") {
+            setPersistError(evt.error ?? "Failed to save this turn");
           } else if (evt.type === "error") {
             throw new Error(evt.error ?? "Stream error");
           }
@@ -256,6 +276,13 @@ export default function ChatPage() {
           </button>
         </div>
       </div>
+
+      {(historyError || persistError) && (
+        <div className="mb-3 rounded-md border border-amber-900/60 bg-amber-950/40 text-amber-200 text-sm px-3 py-2">
+          {historyError && <div>History: {historyError}</div>}
+          {persistError && <div>Save: {persistError}</div>}
+        </div>
+      )}
 
       <div
         ref={scrollRef}

@@ -192,22 +192,45 @@ export async function POST(request: NextRequest) {
         } finally {
           if (succeeded && assistantText) {
             try {
-              await sb.from("messages").insert([
-                {
+              const { error: persistErr } = await sb
+                .from("messages")
+                .insert([
+                  {
+                    document_id: filterDocumentId,
+                    role: "user",
+                    content: query,
+                  },
+                  {
+                    document_id: filterDocumentId,
+                    role: "assistant",
+                    content: assistantText,
+                    citations,
+                  },
+                ]);
+              if (persistErr) {
+                const hint =
+                  /relation .* does not exist|messages.*does not exist/i.test(
+                    persistErr.message
+                  )
+                    ? " — rerun supabase/schema.sql so the messages table exists."
+                    : "";
+                console.error("[chat] PERSIST FAILED", persistErr);
+                send({
+                  type: "persist_error",
+                  error: persistErr.message + hint,
+                });
+              } else {
+                console.log("[chat] persisted turn", {
                   document_id: filterDocumentId,
-                  role: "user",
-                  content: query,
-                },
-                {
-                  document_id: filterDocumentId,
-                  role: "assistant",
-                  content: assistantText,
-                  citations,
-                },
-              ]);
+                });
+              }
             } catch (persistErr) {
-              // Don't break the client stream over a persistence failure.
-              console.error("[chat] failed to persist turn", persistErr);
+              const message =
+                persistErr instanceof Error
+                  ? persistErr.message
+                  : "Unknown persist error";
+              console.error("[chat] persist threw", persistErr);
+              send({ type: "persist_error", error: message });
             }
           }
           controller.close();
