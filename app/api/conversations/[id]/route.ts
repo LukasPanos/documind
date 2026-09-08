@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getSupabase } from "@/lib/supabase";
+import { describeSupabaseError, getSupabase } from "@/lib/supabase";
 import { missingEnvVars } from "@/lib/env-debug";
+import { sessionIdFrom } from "@/lib/session";
 
 export const runtime = "nodejs";
 
@@ -9,7 +10,7 @@ function jsonError(message: string, status: number) {
 }
 
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   ctx: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -17,10 +18,17 @@ export async function DELETE(
     if (missing.length > 0) {
       return jsonError(`Missing env vars: ${missing.join(", ")}`, 500);
     }
+    const sessionId = sessionIdFrom(request);
+    if (!sessionId) return jsonError("Missing session id.", 400);
+
     const { id } = await ctx.params;
     const sb = getSupabase();
-    const { error } = await sb.from("conversations").delete().eq("id", id);
-    if (error) return jsonError(error.message, 500);
+    const { error } = await sb
+      .from("conversations")
+      .delete()
+      .eq("id", id)
+      .eq("session_id", sessionId);
+    if (error) return jsonError(describeSupabaseError(error), 500);
     return NextResponse.json({ ok: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -49,12 +57,16 @@ export async function PATCH(
     const title = body.title?.trim();
     if (!title) return jsonError("Missing 'title'.", 400);
 
+    const sessionId = sessionIdFrom(request);
+    if (!sessionId) return jsonError("Missing session id.", 400);
+
     const sb = getSupabase();
     const { error } = await sb
       .from("conversations")
       .update({ title })
-      .eq("id", id);
-    if (error) return jsonError(error.message, 500);
+      .eq("id", id)
+      .eq("session_id", sessionId);
+    if (error) return jsonError(describeSupabaseError(error), 500);
     return NextResponse.json({ ok: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";

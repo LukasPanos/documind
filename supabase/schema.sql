@@ -8,8 +8,14 @@ create table if not exists documents (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   summary text,
+  -- Browser session that uploaded this doc. Visitors only ever see their
+  -- own rows; purge_stale_sessions() clears them out later.
+  session_id text,
   created_at timestamptz not null default now()
 );
+
+create index if not exists documents_session_idx
+  on documents (session_id, created_at desc);
 
 create table if not exists chunks (
   id uuid primary key default gen_random_uuid(),
@@ -33,9 +39,13 @@ create table if not exists conversations (
   id uuid primary key default gen_random_uuid(),
   document_id uuid references documents(id) on delete cascade,
   title text,
+  session_id text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+create index if not exists conversations_session_idx
+  on conversations (session_id, updated_at desc);
 
 create index if not exists conversations_doc_idx
   on conversations (document_id, updated_at desc);
@@ -72,11 +82,15 @@ create trigger messages_touch_conversation
   after insert on messages
   for each row execute function touch_conversation_updated_at();
 
--- Cosine-similarity RPC. Pass an optional document_id to restrict to a single doc.
+-- Cosine-similarity RPC. Pass an optional document_id to restrict to a single
+-- doc; filter_session_id keeps retrieval inside the caller's own session.
+drop function if exists match_chunks(vector, int, uuid);
+
 create or replace function match_chunks(
   query_embedding vector(1536),
   match_count int default 5,
-  filter_document_id uuid default null
+  filter_document_id uuid default null,
+  filter_session_id text default null
 )
 returns table (
   id uuid,
@@ -97,7 +111,22 @@ as $$
     d.name as document_name
   from chunks c
   join documents d on d.id = c.document_id
-  where filter_document_id is null or c.document_id = filter_document_id
+  where (filter_document_id is null or c.document_id = filter_document_id)
+    and d.session_id = filter_session_id
   order by c.embedding <=> query_embedding
   limit match_count;
+$$;
+
+-- TTL sweep for abandoned sessions. Sessions end when the tab closes, so
+-- nothing is coming back for rows past the cutoff. chunks and messages
+-- cascade; document-scoped conversations cascade with their document.
+create or replace function purge_stale_sessions(older_than interval default interval '24 hours')
+returns void
+language sql volatile
+as $$
+  delete from conversations
+    where updated_at < now() - older_than
+      and document_id is null;
+  delete from documents
+    where created_at < now() - older_than;
 $$;

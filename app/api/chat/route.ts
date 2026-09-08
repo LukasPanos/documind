@@ -1,8 +1,13 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getSupabase, type MatchedChunk } from "@/lib/supabase";
+import {
+  describeSupabaseError,
+  getSupabase,
+  type MatchedChunk,
+} from "@/lib/supabase";
 import { embed } from "@/lib/openai";
-import { getAnthropic, CHAT_MODEL } from "@/lib/anthropic";
+import { getAnthropic, CHAT_MODEL, EFFORT } from "@/lib/anthropic";
 import { logEnvStatus, missingEnvVars } from "@/lib/env-debug";
+import { sessionIdFrom } from "@/lib/session";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -11,8 +16,8 @@ const SYSTEM_PROMPT =
   "Answer using only the provided context. After your answer, list the exact source chunks you used as numbered citations.";
 
 // Cap prior turns sent to the model. 40 turns × ~600 tokens budgets ~24k
-// tokens — well within Sonnet's window and enough for "pick up where I
-// left off" continuity.
+// tokens — a rounding error against the 1M context window, and enough for
+// "pick up where I left off" continuity.
 const HISTORY_TURNS = 40;
 
 const MAX_TITLE_LENGTH = 60;
@@ -54,14 +59,26 @@ export async function GET(request: NextRequest) {
       return jsonError("Missing conversation_id.", 400);
     }
 
+    const sessionId = sessionIdFrom(request);
+    if (!sessionId) return NextResponse.json({ messages: [] });
+
     const sb = getSupabase();
+    const { data: owned, error: ownErr } = await sb
+      .from("conversations")
+      .select("id")
+      .eq("id", conversationId)
+      .eq("session_id", sessionId)
+      .maybeSingle();
+    if (ownErr) return jsonError(describeSupabaseError(ownErr), 500);
+    if (!owned) return NextResponse.json({ messages: [] });
+
     const { data, error } = await sb
       .from("messages")
       .select("id, role, content, citations, created_at")
       .eq("conversation_id", conversationId)
       .order("created_at", { ascending: true });
 
-    if (error) return jsonError(error.message, 500);
+    if (error) return jsonError(describeSupabaseError(error), 500);
     return NextResponse.json({ messages: data ?? [] });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -92,6 +109,11 @@ export async function POST(request: NextRequest) {
     const query = body.query?.trim();
     if (!query) return jsonError("Missing 'query'.", 400);
 
+    const sessionId = sessionIdFrom(request);
+    if (!sessionId) {
+      return jsonError("Missing session id. Reload the page and try again.", 400);
+    }
+
     const sb = getSupabase();
 
     // Resolve which conversation we're appending to. Either client gave
@@ -104,6 +126,7 @@ export async function POST(request: NextRequest) {
         .from("conversations")
         .select("id, document_id")
         .eq("id", conversationId)
+        .eq("session_id", sessionId)
         .maybeSingle();
       if (convErr) {
         console.error("[chat] failed to load conversation", convErr);
@@ -119,6 +142,7 @@ export async function POST(request: NextRequest) {
         .insert({
           document_id: conversationDocumentId,
           title: deriveTitle(query),
+          session_id: sessionId,
         })
         .select("id, document_id")
         .single();
@@ -165,6 +189,7 @@ export async function POST(request: NextRequest) {
       query_embedding: queryEmbedding as unknown as string,
       match_count: 5,
       filter_document_id: conversationDocumentId,
+      filter_session_id: sessionId,
     });
     if (rpcErr) {
       console.error("[chat] match_chunks failed", rpcErr);
@@ -216,7 +241,9 @@ export async function POST(request: NextRequest) {
         try {
           const llmStream = anthropic.messages.stream({
             model: CHAT_MODEL,
-            max_tokens: 1024,
+            // Shared with thinking tokens, so well above the answer length.
+            max_tokens: 8000,
+            output_config: { effort: EFFORT },
             system: SYSTEM_PROMPT,
             messages: [
               ...priorTurns,

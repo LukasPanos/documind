@@ -1,4 +1,8 @@
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import {
+  createClient,
+  type PostgrestError,
+  type SupabaseClient,
+} from "@supabase/supabase-js";
 
 let cached: SupabaseClient | null = null;
 
@@ -49,6 +53,25 @@ export function getSupabase(): SupabaseClient {
     auth: { persistSession: false },
   });
   return cached;
+}
+
+/**
+ * On a network-level failure postgrest-js reports `message` as just
+ * "TypeError: fetch failed" and buries the real reason (DNS, TLS, connect
+ * timeout) in `details` as "Caused by: …". Surface all of it.
+ */
+export function describeSupabaseError(error: PostgrestError | null): string {
+  if (!error) return "Unknown Supabase error";
+  const lines = error.details?.split("\n").map((l) => l.trim()) ?? [];
+  // On a fetch failure the useful line is "Caused by: …"; otherwise `details`
+  // carries Postgres detail text, which is worth keeping minus the stack.
+  const details =
+    lines.find((l) => l.startsWith("Caused by:")) ??
+    lines.filter((l) => l && !/^at\s/.test(l) && l !== error.message).join(" ");
+  return [error.message, details, error.hint, error.code && `code=${error.code}`]
+    .filter(Boolean)
+    .join(" | ")
+    .slice(0, 500);
 }
 
 export type DocumentRow = {

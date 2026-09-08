@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { sessionFetch } from "@/lib/session-client";
+
 type DocumentRow = {
   id: string;
   name: string;
@@ -84,7 +86,7 @@ export default function ChatPage() {
 
   // Fetch document library once.
   useEffect(() => {
-    fetch("/api/upload")
+    sessionFetch("/api/upload")
       .then((r) => r.json())
       .then((j) => setDocuments(j.documents ?? []))
       .catch(() => {});
@@ -94,7 +96,7 @@ export default function ChatPage() {
   useEffect(() => {
     let cancelled = false;
     const docParam = selected === ALL_DOCS ? "null" : selected;
-    fetch(`/api/conversations?document_id=${encodeURIComponent(docParam)}`)
+    sessionFetch(`/api/conversations?document_id=${encodeURIComponent(docParam)}`)
       .then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json() }))
       .then(({ ok, status, body }) => {
         if (cancelled) return;
@@ -148,7 +150,7 @@ export default function ChatPage() {
     if (activeId === null) return;
     if (loadedMessagesFor === activeId) return;
     let cancelled = false;
-    fetch(`/api/chat?conversation_id=${encodeURIComponent(activeId)}`)
+    sessionFetch(`/api/chat?conversation_id=${encodeURIComponent(activeId)}`)
       .then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json() }))
       .then(({ ok, status, body }) => {
         if (cancelled) return;
@@ -228,7 +230,7 @@ export default function ChatPage() {
     let receivedConvId: string | null = null;
 
     try {
-      const res = await fetch("/api/chat", {
+      const res = await sessionFetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -304,7 +306,7 @@ export default function ChatPage() {
         setLoadedMessagesFor(receivedConvId);
         // Refresh the conversation list to include the new one.
         const docParam = selected === ALL_DOCS ? "null" : selected;
-        fetch(`/api/conversations?document_id=${encodeURIComponent(docParam)}`)
+        sessionFetch(`/api/conversations?document_id=${encodeURIComponent(docParam)}`)
           .then((r) => r.json())
           .then((j) => setConversations(j.conversations ?? []))
           .catch(() => {});
@@ -342,7 +344,7 @@ export default function ChatPage() {
   const deleteConversation = useCallback(
     async (id: string) => {
       if (!confirm("Delete this chat? This cannot be undone.")) return;
-      const res = await fetch(`/api/conversations/${id}`, {
+      const res = await sessionFetch(`/api/conversations/${id}`, {
         method: "DELETE",
       }).catch(() => null);
       if (!res || !res.ok) {

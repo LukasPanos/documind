@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { sessionFetch } from "@/lib/session-client";
+
 type DocumentRow = {
   id: string;
   name: string;
@@ -20,7 +22,7 @@ export default function UploadPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch("/api/upload", { method: "GET" });
+      const res = await sessionFetch("/api/upload", { method: "GET" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Failed to load library");
       setDocuments(json.documents ?? []);
@@ -33,7 +35,7 @@ export default function UploadPage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/upload")
+    sessionFetch("/api/upload")
       .then((r) => r.json())
       .then((json) => {
         if (cancelled) return;
@@ -62,7 +64,7 @@ export default function UploadPage() {
         const fd = new FormData();
         fd.append("file", file);
 
-        const res = await fetch("/api/upload", { method: "POST", body: fd });
+        const res = await sessionFetch("/api/upload", { method: "POST", body: fd });
         const raw = await res.text();
         let json: {
           error?: string;

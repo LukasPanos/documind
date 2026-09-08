@@ -1,10 +1,11 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { extractText } from "unpdf";
-import { getSupabase } from "@/lib/supabase";
+import { describeSupabaseError, getSupabase } from "@/lib/supabase";
 import { embedBatch } from "@/lib/openai";
-import { getAnthropic, CHAT_MODEL } from "@/lib/anthropic";
+import { getAnthropic, CHAT_MODEL, EFFORT } from "@/lib/anthropic";
 import { chunkText } from "@/lib/chunk";
 import { logEnvStatus, missingEnvVars } from "@/lib/env-debug";
+import { sessionIdFrom } from "@/lib/session";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -21,7 +22,10 @@ async function summarize(name: string, text: string): Promise<string> {
   const excerpt = text.slice(0, 12000);
   const msg = await getAnthropic().messages.create({
     model: CHAT_MODEL,
-    max_tokens: 400,
+    // Thinking is on by default and shares this budget, so leave headroom
+    // well past the ~400 tokens the summary itself needs.
+    max_tokens: 4000,
+    output_config: { effort: EFFORT },
     system:
       "You write tight, useful one-paragraph summaries of documents for a research analyst. " +
       "Lead with what the document is and who it's for, then the key findings or claims. " +
@@ -46,6 +50,11 @@ export async function POST(request: NextRequest) {
           `Set them in Vercel → Project → Settings → Environment Variables and redeploy.`,
         500
       );
+    }
+
+    const sessionId = sessionIdFrom(request);
+    if (!sessionId) {
+      return jsonError("Missing session id. Reload the page and try again.", 400);
     }
 
     let formData: FormData;
@@ -134,12 +143,16 @@ export async function POST(request: NextRequest) {
 
     const { data: doc, error: docErr } = await supabase
       .from("documents")
-      .insert({ name: file.name, summary })
+      .insert({ name: file.name, summary, session_id: sessionId })
       .select("id, name, summary, created_at")
       .single();
 
     if (docErr || !doc) {
-      return jsonError("Failed to create document row.", 500, docErr?.message);
+      return jsonError(
+        "Failed to create document row.",
+        500,
+        describeSupabaseError(docErr)
+      );
     }
     console.log("[upload] document inserted", { id: doc.id });
 
@@ -153,7 +166,11 @@ export async function POST(request: NextRequest) {
     const { error: chunkErr } = await supabase.from("chunks").insert(rows);
     if (chunkErr) {
       await supabase.from("documents").delete().eq("id", doc.id);
-      return jsonError("Failed to store chunks.", 500, chunkErr.message);
+      return jsonError(
+        "Failed to store chunks.",
+        500,
+        describeSupabaseError(chunkErr)
+      );
     }
 
     console.log("[upload] done", {
@@ -174,7 +191,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     const missing = missingEnvVars();
     if (missing.length > 0) {
@@ -183,13 +200,25 @@ export async function GET() {
         { status: 500 }
       );
     }
-    const { data, error } = await getSupabase()
+    const sessionId = sessionIdFrom(request);
+    if (!sessionId) return NextResponse.json({ documents: [] });
+
+    const sb = getSupabase();
+    // Opportunistic TTL sweep for sessions that never came back.
+    void sb.rpc("purge_stale_sessions").then(({ error }) => {
+      if (error) console.warn("[upload.GET] purge failed", error.message);
+    });
+
+    const { data, error } = await sb
       .from("documents")
       .select("id, name, summary, created_at")
+      .eq("session_id", sessionId)
       .order("created_at", { ascending: false });
 
     if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
+      const detail = describeSupabaseError(error);
+      console.error("[upload.GET] query failed", detail);
+      return NextResponse.json({ error: detail }, { status: 500 });
     }
     return NextResponse.json({ documents: data ?? [] });
   } catch (err) {
